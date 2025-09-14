@@ -1,0 +1,136 @@
+import os
+import pandas as pd
+from PIL import Image
+from pathlib import Path
+from typing import Dict, Any
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+import torchvision.models as models
+
+# ---------------------------
+# Dataset Class
+# ---------------------------
+class SkinDataset(Dataset):
+    def __init__(self, csv_file, img_size=224, augment=True):
+        self.data = pd.read_csv(csv_file)
+        self.img_size = img_size
+        self.augment = augment
+
+        base_tfms = [
+            T.Resize((img_size, img_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
+        ]
+        aug_tfms = [
+            T.RandomHorizontalFlip(),
+            T.RandomRotation(10),
+            T.ColorJitter(0.2, 0.2, 0.2, 0.1),
+        ]
+
+        self.train_tfms = T.Compose(aug_tfms + base_tfms) if augment else T.Compose(base_tfms)
+
+        # encode categorical metadata
+        self.data['gender'] = self.data['gender'].map({'male': 0, 'female': 1})
+        self.data['history'] = self.data['history'].astype('category').cat.codes
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        img = Image.open(row['image_path']).convert("RGB")
+        img = self.train_tfms(img)
+
+        # metadata: [age, gender, history]
+        meta = torch.tensor([row['age'], row['gender'], row['history']], dtype=torch.float)
+
+        label = row['label']  # unified disease label
+        return img, meta, torch.tensor(label, dtype=torch.long)
+
+
+# ---------------------------
+# Multi-Modal Model
+# ---------------------------
+class MultiModalNet(nn.Module):
+    def __init__(self, num_classes, meta_input_dim=3):
+        super().__init__()
+        base = models.resnet50(pretrained=True)
+        self.feature_dim = base.fc.in_features
+        self.cnn = nn.Sequential(*list(base.children())[:-1])
+
+        # metadata branch
+        self.meta_fc = nn.Sequential(
+            nn.Linear(meta_input_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU()
+        )
+
+        # final classifier
+        self.classifier = nn.Linear(self.feature_dim + 16, num_classes)
+
+    def forward(self, img, meta):
+        img_feats = self.cnn(img).flatten(1)
+        meta_feats = self.meta_fc(meta)
+        combined = torch.cat([img_feats, meta_feats], dim=1)
+        return self.classifier(combined)
+
+
+# ---------------------------
+# Training Loop
+# ---------------------------
+def train_model(train_csv, val_csv, num_classes=10, epochs=10, batch_size=16, lr=1e-4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_ds = SkinDataset(train_csv, augment=True)
+    val_ds = SkinDataset(val_csv, augment=False)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    model = MultiModalNet(num_classes=num_classes).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        for imgs, meta, labels in train_loader:
+            imgs, meta, labels = imgs.to(device), meta.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(imgs, meta)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(train_loader):.4f}")
+
+        # validation
+        model.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for imgs, meta, labels in val_loader:
+                imgs, meta, labels = imgs.to(device), meta.to(device), labels.to(device)
+                outputs = model(imgs, meta)
+                preds = outputs.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+        print(f"Validation Accuracy: {100*correct/total:.2f}%")
+
+    return model
+
+
+# ---------------------------
+# Example Usage
+# ---------------------------
+# Example CSV format (train.csv / val.csv):
+# image_path,label,age,gender,history
+# dermnet/eczema/img1.jpg,0,34,male,eczema
+# isic/melanoma/img2.jpg,1,65,female,melanoma
+
+# model = train_model("train.csv", "val.csv", num_classes=5, epochs=5)
